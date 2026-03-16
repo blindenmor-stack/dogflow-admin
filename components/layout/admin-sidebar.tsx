@@ -8,6 +8,7 @@ import {
   Users,
   DollarSign,
   Activity,
+  FileText,
   Settings,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -17,6 +18,7 @@ const navItems = [
   { label: 'Trainers', href: '/trainers', icon: Users },
   { label: 'Receita', href: '/revenue', icon: DollarSign },
   { label: 'Engajamento', href: '/engagement', icon: Activity },
+  { label: 'Blog', href: '/blog', icon: FileText },
   { label: 'Configurações', href: '/settings', icon: Settings },
 ]
 

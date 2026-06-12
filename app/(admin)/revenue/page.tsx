@@ -54,6 +54,35 @@ function cents(v: number | null): number {
   return v === null ? 0 : v / 100
 }
 
+/**
+ * Extrai valor/intervalo da assinatura a partir do jsonb `items`
+ * (shape Stripe: { data: [{ price: { unit_amount, recurring: { interval, interval_count } }, quantity }] }).
+ */
+function subItemInfo(row: Row): {
+  amountCents: number | null
+  interval: string | null
+  intervalCount: number | null
+} {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const items = row.items as any
+  const arr = Array.isArray(items) ? items : Array.isArray(items?.data) ? items.data : []
+  const first = arr[0]
+  const price = first?.price ?? first?.plan ?? null
+  const amount =
+    typeof price?.unit_amount === 'number'
+      ? price.unit_amount
+      : typeof price?.amount === 'number'
+        ? price.amount
+        : null
+  const recurring = price?.recurring ?? price ?? {}
+  const interval = typeof recurring?.interval === 'string' ? recurring.interval : null
+  const intervalCount =
+    typeof recurring?.interval_count === 'number' ? recurring.interval_count : null
+  const qty = typeof first?.quantity === 'number' ? first.quantity : 1
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+  return { amountCents: amount !== null ? amount * qty : null, interval, intervalCount }
+}
+
 /** Normaliza valor da assinatura pra mensal conforme o intervalo. */
 function monthlyValue(amountCents: number | null, interval: string | null, intervalCount: number | null): number {
   const v = cents(amountCents)
@@ -76,7 +105,7 @@ async function getRevenueData() {
     supabase.from('admin_stripe_invoices_recent').select('*').limit(20),
     supabase
       .from('trainers')
-      .select('id, full_name, email, plan, subscription_status, trial_ends_at, created_at'),
+      .select('id, full_name, email, plan, subscription_status, trial_ends_at, created_at, stripe_customer_id'),
   ])
 
   const subs: Row[] = subsRes.error ? [] : subsRes.data || []
@@ -84,16 +113,31 @@ async function getRevenueData() {
   const invoices: Row[] = invRes.error ? [] : invRes.data || []
   const trainers = trainersRes.data || []
 
+  // Cruza customer da Stripe com o trainer (stripe_customer_id)
+  const trainerByStripeCustomer = new Map(
+    trainers
+      .filter((t) => t.stripe_customer_id)
+      .map((t) => [t.stripe_customer_id as string, t])
+  )
+
   // --- Assinaturas reais (Stripe)
   const parsedSubs = subs.map((s) => {
     const status = pickStr(s, ['status']) || 'unknown'
+    const customerId = pickStr(s, ['customer', 'customer_id'])
+    const trainer = customerId ? trainerByStripeCustomer.get(customerId) : null
+    const itemInfo = subItemInfo(s)
     return {
       id: pickStr(s, ['id', 'subscription_id']) || crypto.randomUUID(),
       status,
-      email: pickStr(s, ['customer_email', 'email', 'customer_name', 'customer']) || '—',
-      amountCents: pickNum(s, ['plan_amount', 'unit_amount', 'amount', 'price_amount']),
-      interval: pickStr(s, ['interval', 'plan_interval', 'recurring_interval']),
-      intervalCount: pickNum(s, ['interval_count', 'plan_interval_count']),
+      email:
+        trainer?.full_name ||
+        trainer?.email ||
+        pickStr(s, ['customer_email', 'email', 'customer_name']) ||
+        customerId ||
+        '—',
+      amountCents: itemInfo.amountCents ?? pickNum(s, ['plan_amount', 'unit_amount', 'amount', 'price_amount']),
+      interval: itemInfo.interval ?? pickStr(s, ['interval', 'plan_interval', 'recurring_interval']),
+      intervalCount: itemInfo.intervalCount ?? pickNum(s, ['interval_count', 'plan_interval_count']),
       periodStart: stripeDate(s, ['current_period_start', 'period_start']),
       periodEnd: stripeDate(s, ['current_period_end', 'period_end']),
       created: stripeDate(s, ['created', 'created_at', 'start_date']),
@@ -106,11 +150,11 @@ async function getRevenueData() {
     0
   )
 
-  // --- Receita mensal real (gráfico)
+  // --- Receita mensal real (gráfico) — net_revenue (descontando refunds), fallback gross
   const parsedRevenue = revenueMonthly
     .map((r) => ({
       month: pickStr(r, ['month', 'month_start', 'period', 'mes']) || '',
-      revenue: cents(pickNum(r, ['revenue', 'revenue_cents', 'total', 'amount', 'gross_revenue'])),
+      revenue: cents(pickNum(r, ['net_revenue', 'gross_revenue', 'revenue', 'total', 'amount'])),
       monthDate: stripeDate(r, ['month', 'month_start', 'period']),
     }))
     .filter((r) => r.month !== '')

@@ -23,12 +23,8 @@ function LoginForm() {
     setError('')
     setLoading(true)
 
-    if (email !== 'bernardo@dogflow.com.br') {
-      setError('Acesso restrito. Apenas administradores podem acessar.')
-      setLoading(false)
-      return
-    }
-
+    // A validação de admin acontece no middleware (trainers.is_admin no banco
+    // + fallback do email do Bernardo). Não-admins são deslogados e redirecionados.
     const supabase = createClient()
 
     const { error: authError } = await supabase.auth.signInWithPassword({

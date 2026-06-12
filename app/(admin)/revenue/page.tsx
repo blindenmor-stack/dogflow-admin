@@ -1,9 +1,9 @@
 import { createServiceClient } from '@/lib/supabase/server'
 import { PLAN_PRICES } from '@/lib/types/admin'
+import { listSubscriptionCheckouts } from '@/lib/abacatepay'
 import {
   DollarSign,
   TrendingUp,
-  Users,
   Hourglass,
   AlertTriangle,
   Receipt,
@@ -14,83 +14,59 @@ import { ptBR } from 'date-fns/locale'
 
 export const dynamic = 'force-dynamic'
 
-// ----- Parsing defensivo: as views admin_stripe_* vêm do Stripe Sync Engine
-// e a estrutura pode variar. Tudo aqui tolera campo ausente/null.
+// ─────────────────────────────────────────────────────────────
+// Receita — AbacatePay (substituiu a Stripe em 2026-06-12).
+// Fontes:
+// - trainers: status da assinatura, plano, trials (fonte de verdade)
+// - abacatepay_events: webhooks salvos (pagamentos, valor e
+//   frequência reais de cada assinatura)
+// - API AbacatePay (opcional): status dos checkouts de assinatura
+// ─────────────────────────────────────────────────────────────
 
-type Row = Record<string, unknown>
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
-function pickStr(row: Row, keys: string[]): string | null {
-  for (const k of keys) {
-    const v = row[k]
-    if (typeof v === 'string' && v.length > 0) return v
-    if (typeof v === 'number' && k !== '') return String(v)
+type TrainerRow = {
+  id: string
+  full_name: string | null
+  email: string | null
+  plan: string | null
+  subscription_status: string | null
+  trial_ends_at: string | null
+  created_at: string
+  abacatepay_customer_id: string | null
+  abacatepay_subscription_id: string | null
+  subscription_current_period_end: string | null
+}
+
+type EventRow = {
+  id: string
+  event_type: string
+  payload: any
+  trainer_id: string | null
+  processed: boolean
+  created_at: string
+}
+
+/** Valor mensal (R$) a partir do amount em centavos + frequência AbacatePay. */
+function monthlyValue(amountCents: number | null, frequency: string | null): number | null {
+  if (amountCents === null) return null
+  const v = amountCents / 100
+  switch (frequency) {
+    case 'MONTHLY': return v
+    case 'QUARTERLY': return v / 3
+    case 'SEMIANNUALLY': return v / 6
+    case 'ANNUALLY': return v / 12
+    case 'WEEKLY': return v * 4.33
+    default: return v
   }
-  return null
 }
 
-function pickNum(row: Row, keys: string[]): number | null {
-  for (const k of keys) {
-    const v = row[k]
-    if (typeof v === 'number' && !Number.isNaN(v)) return v
-    if (typeof v === 'string' && v !== '' && !Number.isNaN(Number(v))) return Number(v)
-  }
-  return null
-}
-
-function stripeDate(row: Row, keys: string[]): Date | null {
-  for (const k of keys) {
-    const v = row[k]
-    if (typeof v === 'number') return new Date(v > 10_000_000_000 ? v : v * 1000) // epoch s ou ms
-    if (typeof v === 'string' && v.length > 0) {
-      const d = new Date(v)
-      if (!Number.isNaN(d.getTime())) return d
-    }
-  }
-  return null
-}
-
-/** Stripe guarda valores em centavos. Converte pra reais. */
-function cents(v: number | null): number {
-  return v === null ? 0 : v / 100
-}
-
-/**
- * Extrai valor/intervalo da assinatura a partir do jsonb `items`
- * (shape Stripe: { data: [{ price: { unit_amount, recurring: { interval, interval_count } }, quantity }] }).
- */
-function subItemInfo(row: Row): {
-  amountCents: number | null
-  interval: string | null
-  intervalCount: number | null
-} {
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  const items = row.items as any
-  const arr = Array.isArray(items) ? items : Array.isArray(items?.data) ? items.data : []
-  const first = arr[0]
-  const price = first?.price ?? first?.plan ?? null
-  const amount =
-    typeof price?.unit_amount === 'number'
-      ? price.unit_amount
-      : typeof price?.amount === 'number'
-        ? price.amount
-        : null
-  const recurring = price?.recurring ?? price ?? {}
-  const interval = typeof recurring?.interval === 'string' ? recurring.interval : null
-  const intervalCount =
-    typeof recurring?.interval_count === 'number' ? recurring.interval_count : null
-  const qty = typeof first?.quantity === 'number' ? first.quantity : 1
-  /* eslint-enable @typescript-eslint/no-explicit-any */
-  return { amountCents: amount !== null ? amount * qty : null, interval, intervalCount }
-}
-
-/** Normaliza valor da assinatura pra mensal conforme o intervalo. */
-function monthlyValue(amountCents: number | null, interval: string | null, intervalCount: number | null): number {
-  const v = cents(amountCents)
-  const n = intervalCount && intervalCount > 0 ? intervalCount : 1
-  if (interval === 'year') return v / (12 * n)
-  if (interval === 'week') return (v * 4.33) / n
-  if (interval === 'day') return (v * 30) / n
-  return v / n // month (trimestral = month/3)
+const FREQUENCY_LABEL: Record<string, string> = {
+  MONTHLY: 'Mensal',
+  QUARTERLY: 'Trimestral',
+  SEMIANNUALLY: 'Semestral',
+  ANNUALLY: 'Anual',
+  WEEKLY: 'Semanal',
 }
 
 async function getRevenueData() {
@@ -98,97 +74,106 @@ async function getRevenueData() {
   const now = new Date()
   const in7days = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
 
-  // Views Stripe (podem ainda não existir — degrada com graça)
-  const [subsRes, revRes, invRes, trainersRes] = await Promise.all([
-    supabase.from('admin_stripe_subscriptions').select('*'),
-    supabase.from('admin_stripe_revenue_monthly').select('*'),
-    supabase.from('admin_stripe_invoices_recent').select('*').limit(20),
+  const [trainersRes, eventsRes, apiCheckouts] = await Promise.all([
     supabase
       .from('trainers')
-      .select('id, full_name, email, plan, subscription_status, trial_ends_at, created_at, stripe_customer_id'),
+      .select(
+        'id, full_name, email, plan, subscription_status, trial_ends_at, created_at, abacatepay_customer_id, abacatepay_subscription_id, subscription_current_period_end'
+      ),
+    supabase
+      .from('abacatepay_events')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(1000),
+    listSubscriptionCheckouts(),
   ])
 
-  const subs: Row[] = subsRes.error ? [] : subsRes.data || []
-  const revenueMonthly: Row[] = revRes.error ? [] : revRes.data || []
-  const invoices: Row[] = invRes.error ? [] : invRes.data || []
-  const trainers = trainersRes.data || []
+  const trainers: TrainerRow[] = (trainersRes.data as TrainerRow[]) || []
+  const events: EventRow[] = eventsRes.error ? [] : ((eventsRes.data as EventRow[]) || [])
+  const eventsTableOk = !eventsRes.error
 
-  // Cruza customer da Stripe com o trainer (stripe_customer_id)
-  const trainerByStripeCustomer = new Map(
-    trainers
-      .filter((t) => t.stripe_customer_id)
-      .map((t) => [t.stripe_customer_id as string, t])
-  )
+  const trainerById = new Map(trainers.map((t) => [t.id, t]))
 
-  // --- Assinaturas reais (Stripe)
-  const parsedSubs = subs.map((s) => {
-    const status = pickStr(s, ['status']) || 'unknown'
-    const customerId = pickStr(s, ['customer', 'customer_id'])
-    const trainer = customerId ? trainerByStripeCustomer.get(customerId) : null
-    const itemInfo = subItemInfo(s)
+  // ── Última info de assinatura (valor + frequência) por trainer ──
+  // events já vêm DESC; o primeiro com data.subscription vale como atual.
+  const subInfoByTrainer = new Map<string, { amountCents: number; frequency: string | null }>()
+  for (const ev of events) {
+    const sub = ev.payload?.data?.subscription
+    if (!ev.trainer_id || !sub || typeof sub.amount !== 'number') continue
+    if (!subInfoByTrainer.has(ev.trainer_id)) {
+      subInfoByTrainer.set(ev.trainer_id, {
+        amountCents: sub.amount,
+        frequency: typeof sub.frequency === 'string' ? sub.frequency : null,
+      })
+    }
+  }
+
+  // ── Assinantes ativos + MRR real ──
+  const activeTrainers = trainers.filter((t) => t.subscription_status === 'active')
+  const subscribers = activeTrainers.map((t) => {
+    const info = subInfoByTrainer.get(t.id) || null
+    const monthly = info
+      ? monthlyValue(info.amountCents, info.frequency)
+      : (PLAN_PRICES[(t.plan || 'pro') as keyof typeof PLAN_PRICES] ?? PLAN_PRICES.pro)
     return {
-      id: pickStr(s, ['id', 'subscription_id']) || crypto.randomUUID(),
-      status,
-      email:
-        trainer?.full_name ||
-        trainer?.email ||
-        pickStr(s, ['customer_email', 'email', 'customer_name']) ||
-        customerId ||
-        '—',
-      amountCents: itemInfo.amountCents ?? pickNum(s, ['plan_amount', 'unit_amount', 'amount', 'price_amount']),
-      interval: itemInfo.interval ?? pickStr(s, ['interval', 'plan_interval', 'recurring_interval']),
-      intervalCount: itemInfo.intervalCount ?? pickNum(s, ['interval_count', 'plan_interval_count']),
-      periodStart: stripeDate(s, ['current_period_start', 'period_start']),
-      periodEnd: stripeDate(s, ['current_period_end', 'period_end']),
-      created: stripeDate(s, ['created', 'created_at', 'start_date']),
+      id: t.id,
+      name: t.full_name || t.email || '—',
+      monthly: monthly ?? PLAN_PRICES.pro,
+      frequency: info?.frequency ?? null,
+      periodEnd: t.subscription_current_period_end
+        ? new Date(t.subscription_current_period_end)
+        : null,
+      fromEvents: !!info,
     }
   })
+  const mrrReal = subscribers.reduce((sum, s) => sum + s.monthly, 0)
 
-  const activeSubs = parsedSubs.filter((s) => s.status === 'active' || s.status === 'trialing')
-  const mrrReal = activeSubs.reduce(
-    (sum, s) => sum + monthlyValue(s.amountCents, s.interval, s.intervalCount),
-    0
-  )
+  // ── Pagamentos confirmados (dedupe por payment.id — subscription.completed
+  // e checkout.completed do mesmo pagamento chegam separados) ──
+  const seenPayments = new Set<string>()
+  const payments: { id: string; email: string; amount: number; created: Date | null }[] = []
+  for (const ev of events) {
+    if (!['subscription.completed', 'subscription.renewed', 'checkout.completed'].includes(ev.event_type)) continue
+    const pay = ev.payload?.data?.payment
+    if (!pay) continue
+    const payId: string = typeof pay.id === 'string' ? pay.id : ev.id
+    if (seenPayments.has(payId)) continue
+    seenPayments.add(payId)
+    const cents = typeof pay.paidAmount === 'number' ? pay.paidAmount : typeof pay.amount === 'number' ? pay.amount : null
+    if (cents === null) continue
+    const trainer = ev.trainer_id ? trainerById.get(ev.trainer_id) : null
+    const createdRaw = pay.createdAt || ev.created_at
+    const created = createdRaw ? new Date(createdRaw) : null
+    payments.push({
+      id: payId,
+      email: trainer?.full_name || trainer?.email || ev.payload?.data?.customer?.email || '—',
+      amount: cents / 100,
+      created: created && !Number.isNaN(created.getTime()) ? created : null,
+    })
+  }
 
-  // --- Receita mensal real (gráfico) — net_revenue (descontando refunds), fallback gross
-  const parsedRevenue = revenueMonthly
-    .map((r) => ({
-      month: pickStr(r, ['month', 'month_start', 'period', 'mes']) || '',
-      revenue: cents(pickNum(r, ['net_revenue', 'gross_revenue', 'revenue', 'total', 'amount'])),
-      monthDate: stripeDate(r, ['month', 'month_start', 'period']),
-    }))
-    .filter((r) => r.month !== '')
-    .sort((a, b) => (a.monthDate && b.monthDate ? a.monthDate.getTime() - b.monthDate.getTime() : 0))
+  // ── Receita por mês (gráfico) ──
+  const byMonth = new Map<string, { revenue: number; monthDate: Date }>()
+  for (const p of payments) {
+    if (!p.created) continue
+    const key = format(p.created, 'yyyy-MM')
+    const cur = byMonth.get(key)
+    if (cur) cur.revenue += p.amount
+    else byMonth.set(key, { revenue: p.amount, monthDate: new Date(p.created.getFullYear(), p.created.getMonth(), 1) })
+  }
+  const revenueMonthly = [...byMonth.entries()]
+    .map(([month, v]) => ({ month, ...v }))
+    .sort((a, b) => a.monthDate.getTime() - b.monthDate.getTime())
+  const totalRevenue = payments.reduce((sum, p) => sum + p.amount, 0)
 
-  const totalRevenue =
-    parsedRevenue.length > 0
-      ? parsedRevenue.reduce((sum, r) => sum + r.revenue, 0)
-      : invoices.reduce((sum, i) => {
-          const status = pickStr(i, ['status'])
-          return status === 'paid' ? sum + cents(pickNum(i, ['amount_paid', 'total', 'amount_due'])) : sum
-        }, 0)
-
-  // --- Faturas recentes
-  const parsedInvoices = invoices.map((i) => ({
-    id: pickStr(i, ['id', 'invoice_id']) || crypto.randomUUID(),
-    email: pickStr(i, ['customer_email', 'email', 'customer_name', 'customer']) || '—',
-    amount: cents(pickNum(i, ['amount_paid', 'total', 'amount_due'])),
-    status: pickStr(i, ['status']) || 'unknown',
-    created: stripeDate(i, ['created', 'created_at', 'date']),
-  }))
-
-  // --- Trainers: trials e MRR projetado
+  // ── Trials ──
   const trials = trainers.filter(
-    (t) =>
-      t.subscription_status === 'trial' &&
-      t.trial_ends_at &&
-      new Date(t.trial_ends_at) > now
+    (t) => t.subscription_status === 'trial' && t.trial_ends_at && new Date(t.trial_ends_at) > now
   )
-  const trialsExpiring = trials.filter((t) => new Date(t.trial_ends_at) <= in7days)
+  const trialsExpiring = trials.filter((t) => new Date(t.trial_ends_at!) <= in7days)
   const payingOrTrial = trainers.filter(
     (t) => t.subscription_status === 'active' || t.subscription_status === 'trial'
   )
-  // MRR projetado: se todo trial + ativo pagar o plano (plano único Pro = R$97)
   const mrrProjected = payingOrTrial.reduce((sum, t) => {
     const price = PLAN_PRICES[(t.plan || 'pro') as keyof typeof PLAN_PRICES] ?? PLAN_PRICES.pro
     return sum + price
@@ -196,32 +181,33 @@ async function getRevenueData() {
 
   return {
     mrrReal,
-    activeSubsCount: parsedSubs.filter((s) => s.status === 'active').length,
-    subs: parsedSubs,
-    revenueMonthly: parsedRevenue,
+    subscribers,
+    payments: payments.slice(0, 20),
+    revenueMonthly,
     totalRevenue,
-    invoices: parsedInvoices,
     trialsCount: trials.length,
     trialsExpiring,
     mrrProjected,
-    stripeViewsOk: !subsRes.error,
+    eventsTableOk,
+    apiCheckouts, // null = API indisponível/sem env
   }
 }
 
 const fmt = (v: number) =>
   new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v)
 
-function subStatusBadge(status: string) {
+function checkoutStatusBadge(status: string) {
   switch (status) {
-    case 'active':
-      return { label: 'Ativa', bg: '#F0FDF4', color: '#16A34A' }
-    case 'trialing':
-      return { label: 'Trial', bg: '#FFFBEB', color: '#F59E0B' }
-    case 'past_due':
-      return { label: 'Atrasada', bg: '#FEF2F2', color: '#DC2626' }
-    case 'canceled':
-    case 'cancelled':
+    case 'PAID':
+      return { label: 'Paga', bg: '#F0FDF4', color: '#16A34A' }
+    case 'PENDING':
+      return { label: 'Pendente', bg: '#FFFBEB', color: '#F59E0B' }
+    case 'EXPIRED':
+      return { label: 'Expirada', bg: '#F6F8FA', color: '#8A8AA3' }
+    case 'CANCELLED':
       return { label: 'Cancelada', bg: '#F6F8FA', color: '#8A8AA3' }
+    case 'REFUNDED':
+      return { label: 'Reembolsada', bg: '#FEF2F2', color: '#DC2626' }
     default:
       return { label: status, bg: '#F6F8FA', color: '#8A8AA3' }
   }
@@ -261,17 +247,25 @@ export default async function RevenuePage() {
       <div>
         <h1 className="text-[22px] font-bold" style={{ color: '#244C4E' }}>Receita</h1>
         <p className="text-[14px]" style={{ color: '#8A8AA3' }}>
-          Dados reais da Stripe + projeção por plano dos trainers
+          Assinaturas via AbacatePay (webhooks no banco) + projeção por plano dos trainers
         </p>
       </div>
 
+      {!d.eventsTableOk && (
+        <div className="rounded-2xl border border-[#FDE68A] bg-[#FFFBEB] p-4">
+          <p className="text-[13px] font-medium" style={{ color: '#A16207' }}>
+            Tabela abacatepay_events indisponível — valores reais aparecem quando o primeiro webhook chegar.
+          </p>
+        </div>
+      )}
+
       {/* KPIs */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-5">
-        <KPI icon={DollarSign} label="MRR real (Stripe)" value={fmt(d.mrrReal)} sub={`${d.activeSubsCount} assinatura(s) ativa(s)`} color="#16A34A" />
-        <KPI icon={CreditCard} label="Assinantes ativos" value={String(d.activeSubsCount)} sub="Status active na Stripe" color="#244C4E" />
+        <KPI icon={DollarSign} label="MRR real" value={fmt(d.mrrReal)} sub={`${d.subscribers.length} assinatura(s) ativa(s)`} color="#16A34A" />
+        <KPI icon={CreditCard} label="Assinantes ativos" value={String(d.subscribers.length)} sub="subscription_status = active" color="#244C4E" />
         <KPI icon={Hourglass} label="Trials em andamento" value={String(d.trialsCount)} sub="trial_ends_at no futuro" color="#F59E0B" />
         <KPI icon={AlertTriangle} label="Trials expirando (7d)" value={String(d.trialsExpiring.length)} sub="Atenção: follow-up" color="#DC2626" />
-        <KPI icon={Receipt} label="Receita acumulada" value={fmt(d.totalRevenue)} sub="Faturas pagas (Stripe)" color="#16A34A" />
+        <KPI icon={Receipt} label="Receita acumulada" value={fmt(d.totalRevenue)} sub="Pagamentos confirmados (AbacatePay)" color="#16A34A" />
       </div>
 
       {/* MRR projetado (estimativa por plan) */}
@@ -295,7 +289,7 @@ export default async function RevenuePage() {
 
       {/* Receita mensal real (gráfico de barras) */}
       <div className="flex flex-col gap-4 bg-white p-5" style={{ borderRadius: '16px', border: '1px solid #E2E7F1' }}>
-        <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Receita mensal real (Stripe)</h2>
+        <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Receita mensal real (AbacatePay)</h2>
         {d.revenueMonthly.length > 0 ? (
           <div className="flex items-end gap-2 overflow-x-auto" style={{ height: '160px' }}>
             {d.revenueMonthly.map((r) => (
@@ -310,7 +304,7 @@ export default async function RevenuePage() {
                   }}
                 />
                 <span className="text-[10px]" style={{ color: '#8A8AA3' }}>
-                  {r.monthDate ? format(r.monthDate, 'MMM/yy', { locale: ptBR }) : r.month}
+                  {format(r.monthDate, 'MMM/yy', { locale: ptBR })}
                 </span>
               </div>
             ))}
@@ -319,48 +313,39 @@ export default async function RevenuePage() {
           <div className="flex h-[120px] flex-col items-center justify-center gap-1">
             <Receipt className="h-6 w-6" style={{ color: '#E2E7F1' }} />
             <span className="text-[13px]" style={{ color: '#8A8AA3' }}>Nenhuma receita registrada ainda</span>
-            <span className="text-[11px]" style={{ color: '#B0B0C3' }}>O gráfico aparece com a primeira fatura paga</span>
+            <span className="text-[11px]" style={{ color: '#B0B0C3' }}>O gráfico aparece com o primeiro pagamento confirmado</span>
           </div>
         )}
       </div>
 
-      {/* Assinaturas */}
+      {/* Assinantes ativos */}
       <div className="flex flex-col gap-3">
-        <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Assinaturas (Stripe)</h2>
+        <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Assinantes ativos</h2>
         <div className="overflow-hidden bg-white" style={{ borderRadius: '16px', border: '1px solid #E2E7F1' }}>
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr style={{ backgroundColor: '#F6F8FA' }}>
-                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Cliente</th>
-                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Status</th>
+                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Trainer</th>
+                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Período</th>
                   <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Valor/mês</th>
-                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Período atual</th>
+                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Próxima renovação</th>
                 </tr>
               </thead>
               <tbody>
-                {d.subs.map((s) => {
-                  const badge = subStatusBadge(s.status)
-                  return (
-                    <tr key={s.id} className="border-t" style={{ borderColor: '#E2E7F1' }}>
-                      <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{s.email}</td>
-                      <td className="px-4 py-3">
-                        <span className="inline-flex rounded-full px-2.5 py-0.5 text-[11px] font-medium" style={{ backgroundColor: badge.bg, color: badge.color }}>
-                          {badge.label}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>
-                        {fmt(monthlyValue(s.amountCents, s.interval, s.intervalCount))}
-                      </td>
-                      <td className="px-4 py-3 text-[13px]" style={{ color: '#8A8AA3' }}>
-                        {s.periodStart && s.periodEnd
-                          ? `${format(s.periodStart, 'dd/MM/yy')} → ${format(s.periodEnd, 'dd/MM/yy')}`
-                          : '—'}
-                      </td>
-                    </tr>
-                  )
-                })}
-                {d.subs.length === 0 && (
+                {d.subscribers.map((s) => (
+                  <tr key={s.id} className="border-t" style={{ borderColor: '#E2E7F1' }}>
+                    <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{s.name}</td>
+                    <td className="px-4 py-3 text-[13px]" style={{ color: '#8A8AA3' }}>
+                      {s.frequency ? FREQUENCY_LABEL[s.frequency] || s.frequency : s.fromEvents ? '—' : 'estimado'}
+                    </td>
+                    <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{fmt(s.monthly)}</td>
+                    <td className="px-4 py-3 text-[13px]" style={{ color: '#8A8AA3' }}>
+                      {s.periodEnd ? format(s.periodEnd, 'dd/MM/yyyy', { locale: ptBR }) : '—'}
+                    </td>
+                  </tr>
+                ))}
+                {d.subscribers.length === 0 && (
                   <tr>
                     <td colSpan={4} className="px-4 py-10 text-center">
                       <p className="text-[13px] font-medium" style={{ color: '#8A8AA3' }}>Nenhuma assinatura ainda</p>
@@ -375,6 +360,46 @@ export default async function RevenuePage() {
           </div>
         </div>
       </div>
+
+      {/* Checkouts de assinatura na API (enriquecimento) */}
+      {d.apiCheckouts && d.apiCheckouts.length > 0 && (
+        <div className="flex flex-col gap-3">
+          <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Checkouts de assinatura (API AbacatePay)</h2>
+          <div className="overflow-hidden bg-white" style={{ borderRadius: '16px', border: '1px solid #E2E7F1' }}>
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr style={{ backgroundColor: '#F6F8FA' }}>
+                    <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Data</th>
+                    <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Checkout</th>
+                    <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Valor</th>
+                    <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {d.apiCheckouts.slice(0, 15).map((c) => {
+                    const badge = checkoutStatusBadge(c.status)
+                    return (
+                      <tr key={c.id} className="border-t" style={{ borderColor: '#E2E7F1' }}>
+                        <td className="px-4 py-3 text-[13px]" style={{ color: '#121217' }}>
+                          {format(new Date(c.createdAt), 'dd/MM/yyyy', { locale: ptBR })}
+                        </td>
+                        <td className="px-4 py-3 text-[13px] font-mono" style={{ color: '#8A8AA3' }}>{c.id}{c.devMode ? ' · dev' : ''}</td>
+                        <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{fmt(c.amount / 100)}</td>
+                        <td className="px-4 py-3">
+                          <span className="inline-flex rounded-full px-2.5 py-0.5 text-[11px] font-medium" style={{ backgroundColor: badge.bg, color: badge.color }}>
+                            {badge.label}
+                          </span>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Trials expirando */}
       {d.trialsExpiring.length > 0 && (
@@ -396,7 +421,7 @@ export default async function RevenuePage() {
                       <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{t.full_name || '—'}</td>
                       <td className="px-4 py-3 text-[13px]" style={{ color: '#8A8AA3' }}>{t.email || '—'}</td>
                       <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#DC2626' }}>
-                        {format(new Date(t.trial_ends_at), 'dd/MM/yyyy', { locale: ptBR })}
+                        {format(new Date(t.trial_ends_at!), 'dd/MM/yyyy', { locale: ptBR })}
                       </td>
                     </tr>
                   ))}
@@ -407,9 +432,9 @@ export default async function RevenuePage() {
         </div>
       )}
 
-      {/* Faturas recentes */}
+      {/* Pagamentos recentes */}
       <div className="flex flex-col gap-3">
-        <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Faturas recentes (Stripe)</h2>
+        <h2 className="text-[15px] font-semibold" style={{ color: '#244C4E' }}>Pagamentos recentes (AbacatePay)</h2>
         <div className="overflow-hidden bg-white" style={{ borderRadius: '16px', border: '1px solid #E2E7F1' }}>
           <div className="overflow-x-auto">
             <table className="w-full">
@@ -418,36 +443,24 @@ export default async function RevenuePage() {
                   <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Data</th>
                   <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Cliente</th>
                   <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Valor</th>
-                  <th className="px-4 py-3 text-left text-[12px] font-medium uppercase tracking-wider" style={{ color: '#8A8AA3' }}>Status</th>
                 </tr>
               </thead>
               <tbody>
-                {d.invoices.map((inv) => (
-                  <tr key={inv.id} className="border-t" style={{ borderColor: '#E2E7F1' }}>
+                {d.payments.map((p) => (
+                  <tr key={p.id} className="border-t" style={{ borderColor: '#E2E7F1' }}>
                     <td className="px-4 py-3 text-[13px]" style={{ color: '#121217' }}>
-                      {inv.created ? format(inv.created, 'dd/MM/yyyy', { locale: ptBR }) : '—'}
+                      {p.created ? format(p.created, 'dd/MM/yyyy', { locale: ptBR }) : '—'}
                     </td>
-                    <td className="px-4 py-3 text-[13px]" style={{ color: '#8A8AA3' }}>{inv.email}</td>
-                    <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{fmt(inv.amount)}</td>
-                    <td className="px-4 py-3">
-                      <span
-                        className="inline-flex rounded-full px-2.5 py-0.5 text-[11px] font-medium capitalize"
-                        style={{
-                          backgroundColor: inv.status === 'paid' ? '#F0FDF4' : '#FFFBEB',
-                          color: inv.status === 'paid' ? '#16A34A' : '#F59E0B',
-                        }}
-                      >
-                        {inv.status}
-                      </span>
-                    </td>
+                    <td className="px-4 py-3 text-[13px]" style={{ color: '#8A8AA3' }}>{p.email}</td>
+                    <td className="px-4 py-3 text-[13px] font-medium" style={{ color: '#121217' }}>{fmt(p.amount)}</td>
                   </tr>
                 ))}
-                {d.invoices.length === 0 && (
+                {d.payments.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="px-4 py-10 text-center">
-                      <p className="text-[13px] font-medium" style={{ color: '#8A8AA3' }}>Nenhuma fatura ainda</p>
+                    <td colSpan={3} className="px-4 py-10 text-center">
+                      <p className="text-[13px] font-medium" style={{ color: '#8A8AA3' }}>Nenhum pagamento ainda</p>
                       <p className="mt-1 text-[12px]" style={{ color: '#B0B0C3' }}>
-                        As faturas da Stripe aparecem aqui assim que houver cobranças.
+                        Os pagamentos do AbacatePay aparecem aqui assim que os webhooks chegarem.
                       </p>
                     </td>
                   </tr>

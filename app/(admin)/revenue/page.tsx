@@ -10,7 +10,7 @@ async function getRevenueData() {
   const supabase = await createServiceClient()
 
   const { data: trainers } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('id, full_name, plan')
 
   let mrr = 0

@@ -26,28 +26,28 @@ async function getEngagementData() {
   // Active trainers (logged in last 7 days)
   const sevenDaysAgo = subDays(new Date(), 7)
   const { data: activeTrainers } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('id, full_name, updated_at')
     .gte('updated_at', sevenDaysAgo.toISOString())
 
   // Total trainers
   const { count: totalTrainers } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('*', { count: 'exact', head: true })
 
   // Feature adoption
   const { count: whatsappCount } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('*', { count: 'exact', head: true })
     .eq('whatsapp_connected', true)
 
   const { count: calendarCount } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('*', { count: 'exact', head: true })
     .eq('google_calendar_connected', true)
 
   const { count: onboardingCount } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('*', { count: 'exact', head: true })
     .eq('onboarding_completed', true)
 
@@ -68,7 +68,7 @@ async function getEngagementData() {
     .map(([id]) => id)
 
   const { data: topTrainerProfiles } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('id, full_name, email, plan')
     .in('id', topTrainerIds.length > 0 ? topTrainerIds : ['_'])
 

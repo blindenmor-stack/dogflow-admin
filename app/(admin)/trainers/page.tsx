@@ -10,7 +10,7 @@ async function getTrainersData() {
   const supabase = await createServiceClient()
 
   const { data: trainers } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('*')
     .order('created_at', { ascending: false })
 

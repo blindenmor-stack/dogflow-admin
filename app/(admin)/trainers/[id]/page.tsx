@@ -23,7 +23,7 @@ async function getTrainerData(id: string) {
 
   // Get trainer profile
   const { data: trainer, error } = await supabase
-    .from('profiles')
+    .from('trainers')
     .select('*')
     .eq('id', id)
     .single()

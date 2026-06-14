@@ -2,7 +2,7 @@ import { createServiceClient } from '@/lib/supabase/server'
 import Link from 'next/link'
 import { formatDistanceToNow, format } from 'date-fns'
 import { ptBR } from 'date-fns/locale'
-import { Users, ShieldCheck } from 'lucide-react'
+import { Users, ShieldCheck, Search } from 'lucide-react'
 import { deriveStage, type TrainerMilestones } from '@/lib/funnel'
 
 export const dynamic = 'force-dynamic'
@@ -75,8 +75,33 @@ function getPlanBadgeStyle(plan: string) {
   }
 }
 
-export default async function TrainersPage() {
-  const trainers = await getTrainersData()
+function normalizeDigits(s: string) {
+  return s.replace(/\D/g, '')
+}
+
+export default async function TrainersPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ q?: string }>
+}) {
+  const { q } = await searchParams
+  const allTrainers = await getTrainersData()
+
+  const query = (q || '').trim().toLowerCase()
+  const queryDigits = normalizeDigits(query)
+  const trainers = query
+    ? allTrainers.filter((t) => {
+        const name = (t.full_name || '').toLowerCase()
+        const email = (t.email || '').toLowerCase()
+        const phone = (t.phone || '').toLowerCase()
+        const phoneDigits = normalizeDigits(t.phone || '')
+        const matchText =
+          name.includes(query) || email.includes(query) || phone.includes(query)
+        const matchPhone =
+          queryDigits.length > 0 && phoneDigits.includes(queryDigits)
+        return matchText || matchPhone
+      })
+    : allTrainers
 
   return (
     <div className="flex flex-col gap-6">
@@ -87,7 +112,9 @@ export default async function TrainersPage() {
             Trainers
           </h1>
           <p className="text-[14px]" style={{ color: '#8A8AA3' }}>
-            {trainers.length} adestradores cadastrados
+            {query
+              ? `${trainers.length} de ${allTrainers.length} adestradores`
+              : `${allTrainers.length} adestradores cadastrados`}
           </p>
         </div>
         <div
@@ -100,6 +127,40 @@ export default async function TrainersPage() {
           </span>
         </div>
       </div>
+
+      {/* Busca */}
+      <form method="GET" className="flex items-center gap-2">
+        <div
+          className="flex h-11 flex-1 items-center gap-2 rounded-xl bg-white px-3"
+          style={{ border: '1px solid #E2E7F1' }}
+        >
+          <Search className="h-4 w-4 shrink-0" style={{ color: '#8A8AA3' }} />
+          <input
+            type="text"
+            name="q"
+            defaultValue={q || ''}
+            placeholder="Buscar por nome, email ou telefone..."
+            className="h-full w-full bg-transparent text-[14px] outline-none"
+            style={{ color: '#121217' }}
+          />
+        </div>
+        <button
+          type="submit"
+          className="h-11 rounded-xl px-5 text-[14px] font-semibold"
+          style={{ backgroundColor: '#9EEA6C', color: '#244C4E' }}
+        >
+          Buscar
+        </button>
+        {query && (
+          <Link
+            href="/trainers"
+            className="flex h-11 items-center rounded-xl px-4 text-[14px] font-medium"
+            style={{ backgroundColor: '#F6F8FA', color: '#8A8AA3', border: '1px solid #E2E7F1' }}
+          >
+            Limpar
+          </Link>
+        )}
+      </form>
 
       {/* Table */}
       <div
@@ -245,7 +306,9 @@ export default async function TrainersPage() {
             {trainers.length === 0 && (
               <tr>
                 <td colSpan={11} className="px-4 py-8 text-center text-[13px]" style={{ color: '#8A8AA3' }}>
-                  Nenhum trainer cadastrado ainda.
+                  {query
+                    ? `Nenhum trainer encontrado para "${q}".`
+                    : 'Nenhum trainer cadastrado ainda.'}
                 </td>
               </tr>
             )}

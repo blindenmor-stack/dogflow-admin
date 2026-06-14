@@ -1,4 +1,5 @@
 import { createServerClient } from '@supabase/ssr'
+import { createClient as createSupabaseClient } from '@supabase/supabase-js'
 import { cookies } from 'next/headers'
 
 export async function createClient() {
@@ -26,27 +27,14 @@ export async function createClient() {
   )
 }
 
+// Service client: usa a SERVICE_ROLE_KEY como bearer, SEM cookies de sessão.
+// (O createServerClient do SSR sobrescreve o token com o JWT do cookie do
+// usuário logado, fazendo a RLS limitar tudo ao próprio admin — por isso o
+// painel via só 1 trainer. Aqui o supabase-js puro bypassa a RLS de verdade.)
 export async function createServiceClient() {
-  const cookieStore = await cookies()
-
-  return createServerClient(
+  return createSupabaseClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return cookieStore.getAll()
-        },
-        setAll(cookiesToSet) {
-          try {
-            cookiesToSet.forEach(({ name, value, options }) =>
-              cookieStore.set(name, value, options)
-            )
-          } catch {
-            // The `setAll` method was called from a Server Component.
-          }
-        },
-      },
-    }
+    { auth: { persistSession: false, autoRefreshToken: false } }
   )
 }
